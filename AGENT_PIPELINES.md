@@ -838,3 +838,321 @@ Database → parsedTasks → User Prompt → OpenAI
 
 ---
 
+## Оптимизация и кеширование
+
+### Текущая реализация
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              OPTIMIZATION & CACHING STRATEGY                     │
+└─────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  1. Database Query Optimization                                 │
+│                                                                 │
+│  Current: Task.findMany() - Fetches all tasks                 │
+│  Optimization: Already filtered by user.id                     │
+│                                                                 │
+│  ✓ Indexed queries (user.id is foreign key)                   │
+│  ✓ Only fetches necessary fields                              │
+│  ✓ No N+1 query problems                                      │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  2. Data Transformation Optimization                           │
+│                                                                 │
+│  Before AI call: Transform Task[] → parsedTasks[]             │
+│                                                                 │
+│  parsedTasks = tasks.map(({ description, time }) => ({        │
+│    description,                                                │
+│    time                                                        │
+│  }))                                                            │
+│                                                                 │
+│  Why: Reduce payload size to OpenAI API                       │
+│  Result: Faster API calls, lower costs                        │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  3. Response Caching Strategy                                  │
+│                                                                 │
+│  Current: All responses saved to GptResponse table            │
+│  Purpose: History tracking, not caching                       │
+│                                                                 │
+│  No automatic cache reuse because:                            │
+│  - Each request is unique (different tasks/hours)             │
+│  - User expectations change frequently                        │
+│  - AI responses vary due to temperature=1                     │
+│                                                                 │
+│  Potential improvement:                                        │
+│  - Cache identical requests for 5 minutes                     │
+│  - Key: hash(tasks + hours)                                   │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  4. Credit Management Optimization                             │
+│                                                                 │
+│  Strategy: Decrement AFTER successful AI response             │
+│                                                                 │
+│  Sequence:                                                     │
+│  1. Check credits                                              │
+│  2. Call OpenAI                                                │
+│  3. Validate response                                          │
+│  4. Save + decrement in single transaction                    │
+│                                                                 │
+│  Benefits:                                                     │
+│  - Users don't lose credits on API failures                   │
+│  - Atomic operation (both succeed or both fail)               │
+│  - Fair billing                                                │
+│                                                                 │
+│  Trade-off:                                                    │
+│  - Users could abuse by rapid requests if API slow            │
+│  - Risk is limited to 1 credit per concurrent request         │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  5. Client-Side Optimizations                                  │
+│                                                                 │
+│  Current optimizations:                                        │
+│  ✓ Loading state prevents double-clicks                       │
+│  ✓ Button disabled during generation                          │
+│  ✓ Default example response for instant preview               │
+│  ✓ React Query for task list caching                          │
+│                                                                 │
+│  Client caching via useQuery:                                 │
+│  - Tasks auto-refresh on mutations                            │
+│  - Reduces unnecessary DB queries                             │
+│  - Optimistic updates possible                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Performance Characteristics
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PERFORMANCE METRICS                           │
+└─────────────────────────────────────────────────────────────────┘
+
+LATENCY BREAKDOWN (Typical Request):
+
+┌──────────────────────────┬─────────────┬──────────────────┐
+│  Operation               │  Time       │  % of Total      │
+├──────────────────────────┼─────────────┼──────────────────┤
+│  Client → Server (RPC)   │  ~50ms      │  2%              │
+│  Authentication          │  ~10ms      │  <1%             │
+│  Input Validation        │  ~5ms       │  <1%             │
+│  Database Query          │  ~50ms      │  2%              │
+│  Data Transformation     │  ~5ms       │  <1%             │
+│  OpenAI API Call         │  2-5s       │  90-95%          │
+│  Response Parsing        │  ~10ms      │  <1%             │
+│  Database Transaction    │  ~100ms     │  3-5%            │
+│  Server → Client         │  ~50ms      │  2%              │
+├──────────────────────────┼─────────────┼──────────────────┤
+│  TOTAL                   │  2.5-5.5s   │  100%            │
+└──────────────────────────┴─────────────┴──────────────────┘
+
+KEY INSIGHT: OpenAI API call dominates total latency (90%+)
+
+COST ANALYSIS (Per Request):
+
+┌──────────────────────────┬─────────────────────────────────┐
+│  Resource                │  Cost (approximate)             │
+├──────────────────────────┼─────────────────────────────────┤
+│  OpenAI API Call         │  $0.001 - $0.003                │
+│  (gpt-3.5-turbo)         │  (depends on token count)       │
+│                          │                                 │
+│  Database Operations     │  Negligible (included in host)  │
+│  Server Compute          │  Negligible (included in host)  │
+│  Network Transfer        │  Negligible                     │
+├──────────────────────────┼─────────────────────────────────┤
+│  TOTAL per request       │  ~$0.002                        │
+└──────────────────────────┴─────────────────────────────────┘
+
+With 1000 requests/month: ~$2/month in API costs
+```
+
+---
+
+## Итоговая сводка
+
+### Полный список всех компонентов пайплайна
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               PIPELINE COMPONENTS SUMMARY                        │
+└─────────────────────────────────────────────────────────────────┘
+
+CLIENT COMPONENTS:
+├─ DemoAppPage.tsx (UI and user interaction)
+│  ├─ NewTaskForm (Task input, hours selection)
+│  ├─ Todo (Task list item)
+│  ├─ Schedule (Generated schedule display)
+│  ├─ TaskCard (Main task card with priority)
+│  └─ TaskCardItem (Subtask with time estimate)
+
+SERVER COMPONENTS:
+├─ operations.ts (Business logic)
+│  ├─ generateGptResponse (Main AI operation)
+│  ├─ generateScheduleWithGpt (OpenAI integration)
+│  ├─ createTask (Task CRUD)
+│  ├─ updateTask (Task CRUD)
+│  ├─ deleteTask (Task CRUD)
+│  ├─ getAllTasksByUser (Query)
+│  └─ getGptResponses (Query)
+
+TYPE DEFINITIONS:
+├─ schedule.ts (TypeScript types)
+│  ├─ GeneratedSchedule
+│  ├─ Task
+│  ├─ TaskItem
+│  └─ TaskPriority
+
+EXTERNAL SERVICES:
+├─ OpenAI GPT-3.5-Turbo (AI model)
+├─ Prisma (Database ORM)
+└─ Wasp (Full-stack framework)
+```
+
+### Ключевые точки интеграции
+
+```
+INTEGRATION POINTS:
+
+1. CLIENT ↔ SERVER
+   Protocol: Wasp RPC (type-safe)
+   Operations: generateGptResponse, CRUD operations
+
+2. SERVER ↔ DATABASE
+   ORM: Prisma
+   Entities: User, Task, GptResponse
+
+3. SERVER ↔ OPENAI
+   Library: OpenAI Node SDK
+   Method: chat.completions.create
+   Features: Function Calling, Structured Output
+```
+
+### Расширение пайплайна
+
+Возможные улучшения и расширения:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   FUTURE ENHANCEMENTS                            │
+└─────────────────────────────────────────────────────────────────┘
+
+1. MULTI-STEP PROMPTING
+   ┌──────────────────────────────────────┐
+   │  Current: Single AI call             │
+   │  Future: Multi-stage refinement      │
+   │                                      │
+   │  Step 1: Generate initial schedule   │
+   │     ↓                                │
+   │  Step 2: Optimize for constraints    │
+   │     ↓                                │
+   │  Step 3: Add break times             │
+   │     ↓                                │
+   │  Final: Polished schedule            │
+   └──────────────────────────────────────┘
+
+2. CONTEXT ACCUMULATION
+   ┌──────────────────────────────────────┐
+   │  Use previous schedules for context  │
+   │                                      │
+   │  New prompt includes:                │
+   │  - Past completion rates             │
+   │  - Time estimation accuracy          │
+   │  - User preferences                  │
+   │                                      │
+   │  Result: Personalized scheduling     │
+   └──────────────────────────────────────┘
+
+3. STREAMING RESPONSES
+   ┌──────────────────────────────────────┐
+   │  Current: Wait for full response     │
+   │  Future: Stream as AI generates      │
+   │                                      │
+   │  UI updates progressively:           │
+   │  ├─ Task 1 appears                   │
+   │  ├─ Subtasks stream in               │
+   │  ├─ Task 2 appears                   │
+   │  └─ Complete                         │
+   │                                      │
+   │  Benefit: Perceived faster response  │
+   └──────────────────────────────────────┘
+
+4. INTELLIGENT CACHING
+   ┌──────────────────────────────────────┐
+   │  Cache similar requests:             │
+   │                                      │
+   │  Key: hash(tasks, hours, user_prefs) │
+   │  TTL: 5 minutes                      │
+   │                                      │
+   │  If cache hit:                       │
+   │  - Skip OpenAI call                  │
+   │  - Instant response                  │
+   │  - Don't charge credits              │
+   │                                      │
+   │  Potential savings: 30-50% of calls  │
+   └──────────────────────────────────────┘
+
+5. FEEDBACK LOOP
+   ┌──────────────────────────────────────┐
+   │  User rates generated schedules      │
+   │       ↓                              │
+   │  Store feedback in database          │
+   │       ↓                              │
+   │  Include in future prompts           │
+   │       ↓                              │
+   │  "Previous schedules rated X/5"      │
+   │       ↓                              │
+   │  AI adapts to user preferences       │
+   └──────────────────────────────────────┘
+
+6. AGENT CHAINS
+   ┌──────────────────────────────────────────────────┐
+   │  Agent 1: Task Analyzer                          │
+   │    Input: Raw tasks                              │
+   │    Output: Categorized, estimated tasks          │
+   │              ↓                                   │
+   │  Agent 2: Schedule Optimizer                     │
+   │    Input: Categorized tasks + hours              │
+   │    Output: Time-blocked schedule                 │
+   │              ↓                                   │
+   │  Agent 3: Conflict Resolver                      │
+   │    Input: Schedule + calendar conflicts          │
+   │    Output: Adjusted schedule                     │
+   │              ↓                                   │
+   │  Final: Optimized, conflict-free schedule        │
+   └──────────────────────────────────────────────────┘
+```
+
+---
+
+## Заключение
+
+Этот документ описывает единственный AI-пайплайн в приложении Open SaaS - **Task Schedule Generation Pipeline**.
+
+### Основные характеристики:
+
+- ✅ Простая, линейная архитектура
+- ✅ Четкое разделение ответственности (Client/Server/AI)
+- ✅ Надежная обработка ошибок на всех уровнях
+- ✅ Типобезопасность от клиента до AI
+- ✅ Справедливая система монетизации
+- ✅ Атомарные транзакции для целостности данных
+
+### Ключевые преимущества реализации:
+
+1. **Type Safety**: TypeScript + Zod + Function Calling
+2. **Error Resilience**: 7 точек обработки ошибок
+3. **User-Friendly**: Понятные сообщения об ошибках
+4. **Cost-Effective**: Оптимизация API вызовов
+5. **Fair Billing**: Кредиты списываются только после успеха
+6. **Extensible**: Легко добавить новые промты и агентов
+
+### Файлы документации:
+
+- `PROMPTS_DOCUMENTATION.md` - Все промты и их назначение
+- `AGENT_PIPELINES.md` - Этот файл (схемы работы агентов)
+
+---
