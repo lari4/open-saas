@@ -242,3 +242,250 @@ return gptResponse !== undefined ? JSON.parse(gptResponse) : null;
 - Выбрасывает HTTP 500 ошибку на уровне вызывающей функции (строка 59-64)
 
 ---
+
+## Конфигурация окружения
+
+**Файл конфигурации:** `template/app/.env.server.example`
+
+**Необходимые переменные окружения:**
+
+```bash
+OPENAI_API_KEY=sk-k...
+```
+
+**Инициализация клиента:**
+
+```typescript
+// template/app/src/demo-ai-app/operations.ts:18-25
+const openAi = setUpOpenAi();
+
+function setUpOpenAi(): OpenAI {
+  if (process.env.OPENAI_API_KEY) {
+    return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  } else {
+    throw new Error("OpenAI API key is not set");
+  }
+}
+```
+
+**Обязательные шаги для настройки:**
+1. Получить API ключ от OpenAI (https://platform.openai.com/api-keys)
+2. Создать файл `.env.server` на основе `.env.server.example`
+3. Добавить ключ в переменную `OPENAI_API_KEY`
+4. Перезапустить сервер
+
+---
+
+## Использование
+
+### Клиентская часть
+
+**Файл:** `template/app/src/demo-ai-app/DemoAppPage.tsx`
+
+**Вызов генерации расписания:**
+
+```typescript
+// Строки 145-181
+const handleGeneratePlan = async () => {
+  try {
+    setIsPlanGenerating(true);
+    const response = await generateGptResponse({
+      hours: todaysHours,
+    });
+    if (response) {
+      setResponse(response);
+    }
+  } catch (err: any) {
+    if (err.statusCode === 402) {
+      // Пользователь исчерпал кредиты
+      toast({
+        title: "⚠️ You are out of credits!",
+        action: (
+          <ToastAction altText="Go to pricing page">
+            <Link to={routes.PricingPageRoute.to}>
+              Go to pricing page
+            </Link>
+          </ToastAction>
+        ),
+      });
+    } else {
+      // Общая ошибка
+      toast({
+        title: "Error",
+        description: err.message || "Something went wrong",
+        variant: "destructive",
+      });
+    }
+  } finally {
+    setIsPlanGenerating(false);
+  }
+};
+```
+
+### Серверная часть
+
+**Файл:** `template/app/src/demo-ai-app/operations.ts`
+
+**Входные данные операции:**
+
+```typescript
+// Строки 28-32
+const generateGptResponseInputSchema = z.object({
+  hours: z.number(),
+});
+
+type GenerateGptResponseInput = z.infer<typeof generateGptResponseInputSchema>;
+```
+
+**Основная функция:**
+
+```typescript
+// Строки 34-106
+export const generateGptResponse: GenerateGptResponse<
+  GenerateGptResponseInput,
+  GeneratedSchedule
+> = async (rawArgs, context) => {
+  // 1. Проверка аутентификации
+  if (!context.user) {
+    throw new HttpError(401, "Only authenticated users are allowed");
+  }
+
+  // 2. Валидация входных данных
+  const { hours } = ensureArgsSchemaOrThrowHttpError(
+    generateGptResponseInputSchema,
+    rawArgs,
+  );
+
+  // 3. Получение задач пользователя из БД
+  const tasks = await context.entities.Task.findMany({
+    where: { user: { id: context.user.id } },
+  });
+
+  // 4. Вызов OpenAI API
+  const generatedSchedule = await generateScheduleWithGpt(tasks, hours);
+  if (generatedSchedule === null) {
+    throw new HttpError(500, "Problem with OpenAI communication");
+  }
+
+  // 5. Сохранение результата и управление кредитами
+  const createResponse = context.entities.GptResponse.create({
+    data: {
+      user: { connect: { id: context.user.id } },
+      content: JSON.stringify(generatedSchedule),
+    },
+  });
+
+  const transactions: PrismaPromise<GptResponse | User>[] = [createResponse];
+
+  // Уменьшение кредитов для пользователей без подписки
+  if (!isUserSubscribed(context.user)) {
+    if (context.user.credits > 0) {
+      const decrementCredit = context.entities.User.update({
+        where: { id: context.user.id },
+        data: { credits: { decrement: 1 } },
+      });
+      transactions.push(decrementCredit);
+    } else {
+      throw new HttpError(402, "User has no subscription and is out of credits");
+    }
+  }
+
+  // 6. Выполнение транзакции и возврат результата
+  await prisma.$transaction(transactions);
+  return generatedSchedule;
+};
+```
+
+---
+
+## Система кредитов и монетизация
+
+**Логика проверки подписки:**
+
+```typescript
+// Строки 108-113
+function isUserSubscribed(user: User) {
+  return (
+    user.subscriptionStatus === SubscriptionStatus.Active ||
+    user.subscriptionStatus === SubscriptionStatus.CancelAtPeriodEnd
+  );
+}
+```
+
+**Правила использования:**
+- ✅ Пользователи с активной подпиской - неограниченное использование
+- 💳 Пользователи без подписки - расходуют кредиты (1 кредит = 1 генерация)
+- ⛔ Пользователи без кредитов - получают HTTP 402 ошибку
+
+**Последовательность операций:**
+1. Проверка аутентификации
+2. Валидация входных данных
+3. Получение данных пользователя
+4. Вызов OpenAI API
+5. Сохранение результата
+6. Уменьшение кредитов (если нет подписки)
+
+**Важно:** Кредиты уменьшаются ПОСЛЕ успешного получения ответа от OpenAI, чтобы пользователи не теряли кредиты при ошибках API.
+
+---
+
+## Статистика и хранение
+
+**Сохранение ответов:**
+
+Все генерированные расписания сохраняются в БД в таблице `GptResponse`:
+
+```typescript
+// Строки 66-71
+const createResponse = context.entities.GptResponse.create({
+  data: {
+    user: { connect: { id: context.user.id } },
+    content: JSON.stringify(generatedSchedule),
+  },
+});
+```
+
+**Получение истории:**
+
+```typescript
+// Строки 214-228
+export const getGptResponses: GetGptResponses<void, GptResponse[]> = async (
+  _args,
+  context,
+) => {
+  if (!context.user) {
+    throw new HttpError(401);
+  }
+  return context.entities.GptResponse.findMany({
+    where: {
+      user: { id: context.user.id },
+    },
+  });
+};
+```
+
+---
+
+## Итоговая сводка
+
+**Все промты в приложении:**
+
+| Тип | Назначение | Местоположение |
+|-----|-----------|----------------|
+| System Prompt | Определение роли AI как эксперта по планированию | `operations.ts:264-265` |
+| User Prompt | Передача задач и часов для генерации расписания | `operations.ts:269-271` |
+| Function Definition | Схема структурированного вывода (JSON Schema) | `operations.ts:274-329` |
+
+**Ключевые технологии:**
+- 🤖 OpenAI GPT-3.5-Turbo
+- 🛠️ Function Calling API
+- 🔒 Аутентификация и авторизация
+- 💰 Система кредитов и подписок
+- 💾 Сохранение истории ответов
+
+**Файлы проекта:**
+- `template/app/src/demo-ai-app/operations.ts` - серверная логика
+- `template/app/src/demo-ai-app/DemoAppPage.tsx` - UI и клиентская логика
+- `template/app/src/demo-ai-app/schedule.ts` - TypeScript типы
+
+---
