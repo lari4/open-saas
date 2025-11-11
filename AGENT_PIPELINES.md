@@ -533,3 +533,308 @@ INPUT FROM USER:
 
 ---
 
+## Диаграммы потоков данных
+
+### Поток данных через промты
+
+```
+USER DATA → SYSTEM PROMPT + USER PROMPT → FUNCTION SCHEMA → AI → STRUCTURED JSON
+
+┌──────────────────────────────────────────────────────────────┐
+│ Детальная схема передачи данных через промты                │
+└──────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐
+│   User Tasks    │
+│  from Database  │
+└────────┬────────┘
+         │
+         ├─────────────────────────────────────┐
+         │                                     │
+         ▼                                     ▼
+┌──────────────────┐              ┌──────────────────────┐
+│  System Prompt   │              │    User Prompt       │
+│  (Static)        │              │    (Dynamic)         │
+│                  │              │                      │
+│  Role:           │              │  Data Injection:     │
+│  "Expert daily   │              │  - hours: 8          │
+│   planner"       │              │  - tasks: [...]      │
+│                  │              │                      │
+│  Instructions:   │              │  Request:            │
+│  "Break into     │              │  "Help me plan       │
+│   3 subtasks"    │              │   my day..."         │
+└────────┬─────────┘              └──────────┬───────────┘
+         │                                   │
+         └──────────────┬────────────────────┘
+                        │
+                        ▼
+         ┌──────────────────────────┐
+         │   Combined Message       │
+         │   Array to OpenAI        │
+         │                          │
+         │   [                      │
+         │     {role: "system",...},│
+         │     {role: "user",...}   │
+         │   ]                      │
+         └──────────┬───────────────┘
+                    │
+                    ├─────────────────────────┐
+                    │                         │
+                    ▼                         ▼
+         ┌──────────────────┐    ┌──────────────────────┐
+         │  Function Schema │    │   OpenAI Model       │
+         │                  │    │   gpt-3.5-turbo      │
+         │  Defines:        │───→│                      │
+         │  - Output shape  │    │   Processing:        │
+         │  - Field types   │    │   1. Understand role │
+         │  - Constraints   │    │   2. Parse tasks     │
+         └──────────────────┘    │   3. Generate plan   │
+                                 │   4. Format output   │
+                                 └──────────┬───────────┘
+                                            │
+                                            ▼
+                         ┌──────────────────────────────┐
+                         │   Structured JSON Response   │
+                         │                              │
+                         │   {                          │
+                         │     tasks: [...],            │
+                         │     taskItems: [...]         │
+                         │   }                          │
+                         │                              │
+                         │   ✓ Type-safe                │
+                         │   ✓ Validated                │
+                         │   ✓ Ready for DB/UI          │
+                         └──────────────────────────────┘
+```
+
+### Связь промтов с данными
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             PROMPT-TO-DATA RELATIONSHIP MATRIX                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌───────────────┬──────────────────┬──────────────────────────────┐
+│  Prompt Type  │   Input Data     │       Output Data            │
+├───────────────┼──────────────────┼──────────────────────────────┤
+│               │                  │                              │
+│  System       │  NONE            │  AI Behavior Context         │
+│  Prompt       │  (Static text)   │  - Role: Daily planner       │
+│               │                  │  - Rule: 3+ subtasks         │
+│               │                  │  - Tone: Professional        │
+│               │                  │                              │
+├───────────────┼──────────────────┼──────────────────────────────┤
+│               │                  │                              │
+│  User         │  - hours: number │  Contextual Information      │
+│  Prompt       │  - tasks: [{     │  - Work duration: 8h         │
+│               │      description,│  - Task list with times      │
+│               │      time        │  - User's expectations       │
+│               │    }]            │                              │
+│               │                  │                              │
+├───────────────┼──────────────────┼──────────────────────────────┤
+│               │                  │                              │
+│  Function     │  Schema          │  Structured Output           │
+│  Definition   │  Definition      │  - tasks: [                  │
+│               │  (JSON Schema)   │      {name, priority}        │
+│               │                  │    ]                         │
+│               │                  │  - taskItems: [              │
+│               │                  │      {description,time,...}  │
+│               │                  │    ]                         │
+│               │                  │                              │
+└───────────────┴──────────────────┴──────────────────────────────┘
+
+DATA FLOW THROUGH PROMPTS:
+
+Database → parsedTasks → User Prompt → OpenAI
+              ↓             ↓            ↓
+         [Task, ...]   "I will work   Processing
+                       8 hours..."
+                            ↓
+                       Function Schema → Structured JSON
+                            ↓                 ↓
+                       Type Constraints   Valid Output
+                            ↓                 ↓
+                       OpenAI validates → Returns JSON
+```
+
+---
+
+## Обработка ошибок
+
+### Полная схема обработки ошибок
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ERROR HANDLING FLOW                         │
+└─────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 1: Authentication                                  │
+│  Location: operations.ts:38-43                                 │
+│                                                                 │
+│  Check: context.user exists?                                   │
+│  ├─ NO → HttpError(401)                                        │
+│  │       Message: "Only authenticated users..."               │
+│  │       ↓                                                      │
+│  │       CLIENT: Redirect to login page                       │
+│  └─ YES → Continue to next step                               │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 2: Input Validation                               │
+│  Location: operations.ts:45-48                                 │
+│                                                                 │
+│  Validator: Zod Schema                                         │
+│  Schema: z.object({ hours: z.number() })                      │
+│                                                                 │
+│  Check: Input matches schema?                                  │
+│  ├─ NO → HttpError(400)                                        │
+│  │       Message: "Invalid input: hours must be a number"     │
+│  │       ↓                                                      │
+│  │       CLIENT: Show validation error                        │
+│  └─ YES → Continue to next step                               │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 3: Database Query                                 │
+│  Location: operations.ts:49-55                                 │
+│                                                                 │
+│  Query: Task.findMany(...)                                     │
+│                                                                 │
+│  Possible Errors:                                              │
+│  ├─ Database connection failed                                 │
+│  │   → Thrown by Prisma, caught by Wasp                       │
+│  │   → CLIENT: Show generic error                             │
+│  │                                                              │
+│  └─ User has no tasks (not an error, continue with empty [])  │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 4: OpenAI API Call                                │
+│  Location: operations.ts:259-337                               │
+│                                                                 │
+│  Possible Errors:                                              │
+│  ├─ API Key Invalid/Missing                                    │
+│  │   → Thrown at startup: "OpenAI API key is not set"        │
+│  │   → Server fails to start                                  │
+│  │                                                              │
+│  ├─ Rate Limit Exceeded                                        │
+│  │   → OpenAI throws error                                    │
+│  │   → Caught and returns null                                │
+│  │   → Triggers ERROR POINT 5                                 │
+│  │                                                              │
+│  ├─ Network Error                                              │
+│  │   → Timeout or connection failure                          │
+│  │   → Caught and returns null                                │
+│  │   → Triggers ERROR POINT 5                                 │
+│  │                                                              │
+│  ├─ Invalid Model Response                                     │
+│  │   → AI returns malformed JSON                              │
+│  │   → JSON.parse fails                                       │
+│  │   → Caught and returns null                                │
+│  │   → Triggers ERROR POINT 5                                 │
+│  │                                                              │
+│  └─ Success → Continue to next step                           │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 5: AI Response Validation                        │
+│  Location: operations.ts:59-64                                 │
+│                                                                 │
+│  Check: generatedSchedule !== null?                           │
+│  ├─ NO → HttpError(500)                                        │
+│  │       Message: "Problem with OpenAI communication"         │
+│  │       ↓                                                      │
+│  │       CLIENT: Show error toast                             │
+│  │       Toast: "Error: Something went wrong"                 │
+│  └─ YES → Continue to next step                               │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 6: Credit Check (Non-Subscribed Users)           │
+│  Location: operations.ts:83-99                                 │
+│                                                                 │
+│  Check: isUserSubscribed(context.user)?                       │
+│  ├─ YES → Skip credit check, continue                         │
+│  │                                                              │
+│  └─ NO → Check credits                                         │
+│      Check: user.credits > 0?                                  │
+│      ├─ NO → HttpError(402)                                    │
+│      │       Message: "User has no subscription and is        │
+│      │                 out of credits"                        │
+│      │       ↓                                                  │
+│      │       CLIENT: Show "out of credits" toast              │
+│      │       Toast: "⚠️ You are out of credits!"              │
+│      │       Action: Link to pricing page                     │
+│      │                                                          │
+│      └─ YES → Prepare credit decrement, continue              │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  ERROR POINT 7: Database Transaction                          │
+│  Location: operations.ts:103                                   │
+│                                                                 │
+│  Operations:                                                   │
+│  1. Create GptResponse                                         │
+│  2. Decrement user credits (if applicable)                    │
+│                                                                 │
+│  Transaction Failure:                                          │
+│  ├─ Database constraint violation                             │
+│  │   → Prisma throws error                                    │
+│  │   → Transaction rolled back automatically                  │
+│  │   → Error propagated to client                             │
+│  │                                                              │
+│  ├─ Connection lost during transaction                        │
+│  │   → Prisma throws error                                    │
+│  │   → Transaction rolled back                                │
+│  │   → CLIENT: Show generic error                             │
+│  │                                                              │
+│  └─ Success → Return generatedSchedule                        │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│  CLIENT: Error Display                                         │
+│  Location: DemoAppPage.tsx:154-181                            │
+│                                                                 │
+│  Error Handling:                                               │
+│                                                                 │
+│  try {                                                         │
+│    // Call API                                                 │
+│  } catch (err) {                                               │
+│    if (err.statusCode === 402) {                             │
+│      // Out of credits → Show toast with pricing link        │
+│    } else {                                                    │
+│      // Generic error → Show error toast                     │
+│    }                                                            │
+│  } finally {                                                   │
+│    setIsPlanGenerating(false); // Always clear loading       │
+│  }                                                              │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Матрица HTTP ошибок
+
+```
+┌──────────┬───────────────────────┬──────────────────────────────┐
+│  Code    │  Trigger              │  User Experience             │
+├──────────┼───────────────────────┼──────────────────────────────┤
+│  401     │  Not authenticated    │  Redirect to login page      │
+├──────────┼───────────────────────┼──────────────────────────────┤
+│  402     │  Out of credits       │  Toast: "⚠️ Out of credits!" │
+│          │  (Payment Required)   │  Action: Link to pricing     │
+├──────────┼───────────────────────┼──────────────────────────────┤
+│  500     │  OpenAI API failure   │  Toast: "Error: Something    │
+│          │  Database error       │         went wrong"          │
+│          │  Server error         │  Variant: destructive (red)  │
+└──────────┴───────────────────────┴──────────────────────────────┘
+```
+
+---
+
