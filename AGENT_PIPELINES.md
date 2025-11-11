@@ -258,3 +258,278 @@
 
 ---
 
+### Детальный поток данных между промтами
+
+Эта диаграмма показывает, какие данные передаются между каждым этапом обработки и как трансформируются промты.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DATA TRANSFORMATION FLOW                      │
+└─────────────────────────────────────────────────────────────────┘
+
+INPUT FROM USER:
+┌───────────────────────────────────────┐
+│  User Input                           │
+│  - todaysHours: 8                     │
+│  - tasks: [                           │
+│      { description: "Emails", ... },  │
+│      { description: "Learn WASP", ... }│
+│    ]                                  │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 1: Client Side Preparation                               │
+│  Function: handleGeneratePlan()                                │
+│                                                                 │
+│  Input:  { hours: 8 }                                          │
+│  Output: RPC Call to generateGptResponse({ hours: 8 })        │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 2: Server Side - Fetch Tasks from DB                    │
+│  Function: context.entities.Task.findMany()                   │
+│                                                                 │
+│  Input:  user.id                                               │
+│  Output: Task[] = [                                            │
+│    {                                                            │
+│      id: "task_123",                                           │
+│      description: "Respond to emails",                         │
+│      time: "2",                                                │
+│      isDone: false,                                            │
+│      userId: "user_456",                                       │
+│      createdAt: "2024-01-15T10:00:00Z"                        │
+│    },                                                           │
+│    {                                                            │
+│      id: "task_124",                                           │
+│      description: "Learn WASP",                                │
+│      time: "3",                                                │
+│      isDone: false,                                            │
+│      userId: "user_456",                                       │
+│      createdAt: "2024-01-15T10:05:00Z"                        │
+│    }                                                            │
+│  ]                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 3: Data Transformation for AI                           │
+│  Function: parsedTasks = tasks.map(...)                       │
+│                                                                 │
+│  Input:  Task[] (full objects from DB)                        │
+│  Transform: Extract only { description, time }                │
+│  Output: parsedTasks = [                                       │
+│    { description: "Respond to emails", time: "2" },           │
+│    { description: "Learn WASP", time: "3" }                   │
+│  ]                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 4: Construct System Prompt (Static)                     │
+│  Location: operations.ts:264-265                               │
+│                                                                 │
+│  Prompt:                                                        │
+│  "you are an expert daily planner. you will be given a        │
+│   list of main tasks and an estimated time to complete        │
+│   each task. You will also receive the total amount of        │
+│   hours to be worked that day. Your job is to return a        │
+│   detailed plan of how to achieve those tasks by breaking     │
+│   each task down into at least 3 subtasks each. MAKE SURE     │
+│   TO ALWAYS CREATE AT LEAST 3 SUBTASKS FOR EACH MAIN TASK     │
+│   PROVIDED BY THE USER! YOU WILL BE REWARDED IF YOU DO."      │
+│                                                                 │
+│  Role: "system"                                                │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 5: Construct User Prompt (Dynamic)                      │
+│  Location: operations.ts:269-271                               │
+│                                                                 │
+│  Template:                                                      │
+│  `I will work ${hours} hours today. Here are the tasks I      │
+│   have to complete: ${JSON.stringify(parsedTasks)}.           │
+│   Please help me plan my day by breaking the tasks down       │
+│   into actionable subtasks with time and priority status.`    │
+│                                                                 │
+│  Injected Data:                                                │
+│    - hours = 8                                                 │
+│    - parsedTasks = [{"description":"Respond to emails",       │
+│                      "time":"2"},                              │
+│                     {"description":"Learn WASP","time":"3"}]  │
+│                                                                 │
+│  Final Prompt:                                                 │
+│  "I will work 8 hours today. Here are the tasks I have to     │
+│   complete: [{"description":"Respond to emails","time":"2"},  │
+│   {"description":"Learn WASP","time":"3"}]. Please help me    │
+│   plan my day by breaking the tasks down into actionable      │
+│   subtasks with time and priority status."                    │
+│                                                                 │
+│  Role: "user"                                                  │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 6: Send to OpenAI with Function Definition              │
+│  Location: operations.ts:259-337                               │
+│                                                                 │
+│  Request Payload:                                              │
+│  {                                                              │
+│    model: "gpt-3.5-turbo",                                    │
+│    messages: [                                                 │
+│      { role: "system", content: "[System Prompt]" },         │
+│      { role: "user", content: "[User Prompt]" }              │
+│    ],                                                           │
+│    tools: [{                                                   │
+│      type: "function",                                         │
+│      function: {                                               │
+│        name: "parseTodaysSchedule",                           │
+│        description: "parses the days tasks...",               │
+│        parameters: {                                           │
+│          type: "object",                                       │
+│          properties: {                                         │
+│            tasks: { ... },                                     │
+│            taskItems: { ... }                                  │
+│          }                                                      │
+│        }                                                        │
+│      }                                                          │
+│    }],                                                          │
+│    tool_choice: {                                              │
+│      type: "function",                                         │
+│      function: { name: "parseTodaysSchedule" }                │
+│    },                                                           │
+│    temperature: 1                                              │
+│  }                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 7: OpenAI Processing (Internal)                         │
+│                                                                 │
+│  1. Parse system prompt → Set AI behavior/role                │
+│  2. Parse user prompt → Extract task data and context         │
+│  3. Analyze function schema → Understand output structure     │
+│  4. Generate response → Create structured schedule            │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 8: OpenAI Response                                       │
+│                                                                 │
+│  Response from OpenAI:                                         │
+│  {                                                              │
+│    choices: [{                                                 │
+│      message: {                                                │
+│        role: "assistant",                                      │
+│        tool_calls: [{                                          │
+│          type: "function",                                     │
+│          function: {                                           │
+│            name: "parseTodaysSchedule",                       │
+│            arguments: "{                                       │
+│              \"tasks\": [                                      │
+│                {                                               │
+│                  \"name\": \"Respond to emails\",             │
+│                  \"priority\": \"high\"                        │
+│                },                                              │
+│                {                                               │
+│                  \"name\": \"Learn WASP\",                    │
+│                  \"priority\": \"medium\"                      │
+│                }                                               │
+│              ],                                                │
+│              \"taskItems\": [                                  │
+│                {                                               │
+│                  \"description\": \"Check and respond...\",   │
+│                  \"time\": 1,                                  │
+│                  \"taskName\": \"Respond to emails\"          │
+│                },                                              │
+│                {                                               │
+│                  \"description\": \"Organize emails...\",     │
+│                  \"time\": 0.5,                                │
+│                  \"taskName\": \"Respond to emails\"          │
+│                },                                              │
+│                ...                                             │
+│              ]                                                 │
+│            }"                                                  │
+│          }                                                      │
+│        }]                                                       │
+│      }                                                          │
+│    }]                                                           │
+│  }                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 9: Parse Response on Server                             │
+│  Function: JSON.parse(gptResponse)                            │
+│  Location: operations.ts:339-341                               │
+│                                                                 │
+│  Extract:                                                       │
+│    completion.choices[0].message.tool_calls[0]                │
+│      .function.arguments                                       │
+│                                                                 │
+│  Parse: Convert JSON string to object                         │
+│                                                                 │
+│  Output: GeneratedSchedule = {                                │
+│    tasks: [                                                    │
+│      { name: "Respond to emails", priority: "high" },        │
+│      { name: "Learn WASP", priority: "medium" }              │
+│    ],                                                           │
+│    taskItems: [                                                │
+│      {                                                         │
+│        description: "Check and respond to important emails",  │
+│        time: 1,                                                │
+│        taskName: "Respond to emails"                          │
+│      },                                                        │
+│      {                                                         │
+│        description: "Organize and prioritize emails",         │
+│        time: 0.5,                                              │
+│        taskName: "Respond to emails"                          │
+│      },                                                        │
+│      ...                                                       │
+│    ]                                                            │
+│  }                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 10: Save to Database                                     │
+│  Location: operations.ts:66-71                                 │
+│                                                                 │
+│  Create GptResponse:                                           │
+│  {                                                              │
+│    id: "response_789",                                        │
+│    userId: "user_456",                                        │
+│    content: "{\"tasks\":[...],\"taskItems\":[...]}",         │
+│    createdAt: "2024-01-15T10:15:00Z"                         │
+│  }                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 11: Return to Client                                     │
+│                                                                 │
+│  RPC Response: GeneratedSchedule (TypeScript object)          │
+│  {                                                              │
+│    tasks: Task[],                                              │
+│    taskItems: TaskItem[]                                       │
+│  }                                                              │
+└────────────────┬───────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 12: Render in UI                                         │
+│  Components: Schedule → TaskCard → TaskCardItem               │
+│                                                                 │
+│  Display:                                                       │
+│  - Main tasks sorted by priority (high → low)                 │
+│  - Each task card color-coded by priority                     │
+│  - Subtasks listed under each main task                       │
+│  - Time estimates shown in human-readable format              │
+│  - Interactive checkboxes for completion tracking             │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
